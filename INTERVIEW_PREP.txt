@@ -1,0 +1,1103 @@
+================================================================================
+CAMPUS-CONNECT — TOP 50 INTERVIEW QUESTIONS & ANSWERS
+================================================================================
+
+PROJECT SUMMARY (memorize this elevator pitch):
+Campus-Connect is a full-stack campus discussion platform with a RAG-powered
+chatbot that answers interview-experience questions using a hybrid of private
+campus discussion data and live web search. Built with React (frontend),
+Express/Node (backend API), and a separate FastAPI Python service for the
+RAG pipeline. Storage is MongoDB Atlas with Vector Search for semantic
+retrieval. LLM is Google Gemini 2.5 Flash (with Groq Llama-3.3 as fallback).
+
+ARCHITECTURE AT A GLANCE:
+  Frontend (React/Vite, port 5173)
+        |  axios + cookies
+        v
+  Node Backend (Express, port 8000) -- handles auth, CRUD, discussions
+        |  axios -> calls Python service
+        v
+  Python RAG Service (FastAPI, port 8001) -- embed + retrieve + rerank + LLM
+        |
+        v
+  MongoDB Atlas (shared "test" database, "discussions" collection)
+
+
+================================================================================
+SECTION 1 — PROJECT OVERVIEW & SYSTEM DESIGN  (Q1-Q7)
+================================================================================
+
+------------------------------------------------------------------------------
+Q1. Walk me through your project in 2 minutes.
+------------------------------------------------------------------------------
+ANSWER:
+Campus-Connect is a platform where college students post discussions about
+interviews, placements, competitive programming, and career advice. The
+flagship feature is a chatbot that uses Retrieval-Augmented Generation to
+answer questions by combining knowledge from our own discussion data with
+live web search for recency.
+
+I split the system into three services:
+  1. A React frontend for the UI
+  2. A Node/Express backend that handles auth, CRUD, and orchestration
+  3. A separate Python FastAPI service that owns the entire RAG pipeline -
+     embedding generation, vector search, reranking, and LLM calls
+
+The two backends share the same MongoDB Atlas database. When a new
+discussion is created, the Node API saves it and fires off a request to the
+Python service to embed and store the vector. When a user asks the chatbot,
+Node forwards the query to the Python service, which runs vector search,
+reranks the results, optionally adds web search, and asks Gemini to generate
+the answer.
+
+------------------------------------------------------------------------------
+Q2. Why did you split Node and Python into two separate services?
+------------------------------------------------------------------------------
+ANSWER:
+Two reasons:
+  1. The AI/ML ecosystem in Python is far more mature - the official
+     google-generativeai SDK, sentence-transformers, LangChain, all native.
+     Forcing this into Node would mean either using less-maintained ports
+     or REST calls that lose type safety.
+  2. Separation of concerns. The Node backend handles fast CRUD, auth, and
+     business logic. The Python service handles slow, CPU-bound AI work.
+     They can scale independently - I can spin up more Python workers
+     during heavy chat traffic without touching the Node side.
+
+The tradeoff is one extra network hop and operational complexity. For a
+small project the simpler choice is one monolith, but I wanted clean
+boundaries so the AI service could be reused or replaced later.
+
+------------------------------------------------------------------------------
+Q3. Why MongoDB and not PostgreSQL?
+------------------------------------------------------------------------------
+ANSWER:
+Three reasons:
+  1. Schema flexibility. Discussions have arrays (tags, comments), nested
+     objects (createdBy, education), and the embedding field is a 768-dim
+     array. Mongoose schemas keep some structure without forcing a rigid
+     relational layout.
+  2. MongoDB Atlas Vector Search lets me store embeddings on the document
+     itself, so I avoid running a separate vector database like Pinecone.
+     One connection string for the whole app.
+  3. Mongoose is the dominant ODM in the Node ecosystem and integrates
+     cleanly with the rest of my stack.
+
+If I were building this for a banking transaction system or a multi-table
+JOIN-heavy report, I would pick Postgres. For document-shaped social data
+with vector search, Mongo is a better fit.
+
+------------------------------------------------------------------------------
+Q4. What does your data model look like?
+------------------------------------------------------------------------------
+ANSWER:
+Two core models:
+
+USER (Backend/models/User.model.js):
+  - username, email, password (bcrypt-hashed)
+  - profileimage, bio
+  - education {college, degree, branch, year, cgpa}
+  - competitiveLinks + ratings {codeforces, codechef, leetcode, hackerrank}
+  - socialLinks {github, linkedin, portfolio}
+  - certifications [{name, platform, completionDate}]
+  - likedPosts, likedDiscussions (used for collaborative filtering)
+  - refreshtoken (rotates on login)
+
+DISCUSSION (Backend/models/Discussion.model.js):
+  - title, content (required)
+  - tags []
+  - createdBy {id (ObjectId ref user), username}
+  - likes, views, comments [nested]
+  - category enum (interview-experience, placement-prep, etc.)
+  - embedding [Number] with select:false so we never accidentally return it
+    to the API (saves bandwidth)
+  - timestamps: true for createdAt/updatedAt
+
+I denormalized 'username' inside createdBy on purpose - avoids an extra
+populate call when just displaying the post.
+
+------------------------------------------------------------------------------
+Q5. How does authentication work end-to-end?
+------------------------------------------------------------------------------
+ANSWER:
+JWT-based with access + refresh tokens:
+  - Password is hashed with bcrypt (10 rounds) via a Mongoose pre('save')
+    hook so plain text never touches the database.
+  - On login, server generates an access token (short-lived) and a refresh
+    token (long-lived), stores the refresh token on the user document, and
+    sets both as httpOnly cookies.
+  - The frontend stores user info in localStorage with a 24-hour expiry so
+    the React state can rehydrate on refresh without an extra API call.
+  - The AuthContext runs checkAuth() once when the app mounts (or on full
+    page refresh), reads localStorage, validates expiry, and if needed
+    falls back to GET /user/current-user to revalidate against the server.
+  - Logout clears localStorage and tells the server to clear the refresh
+    token cookie.
+
+------------------------------------------------------------------------------
+Q6. Why did you pick FastAPI for the Python service?
+------------------------------------------------------------------------------
+ANSWER:
+Three reasons:
+  1. Native async support - matters for I/O-bound work like calling Gemini.
+  2. Automatic request validation via Pydantic. My EmbedRequest and
+     ChatRequest models in main.py validate types before the handler runs,
+     so I don't write defensive code.
+  3. Auto-generated OpenAPI docs at /docs - made testing trivial.
+
+Flask was the alternative but it would have meant adding marshmallow for
+validation and flask-async for concurrency. FastAPI gives that out of the
+box.
+
+------------------------------------------------------------------------------
+Q7. How would you scale this for 100k users?
+------------------------------------------------------------------------------
+ANSWER:
+A few moves, in order of impact:
+  1. Move the embedding step to a background queue (BullMQ on the Node
+     side, or Celery on Python) - right now it's fire-and-forget which is
+     fine for low traffic but drops on failure.
+  2. Add Redis caching for embedded queries - the same chat questions are
+     asked repeatedly, no point re-embedding "tell me about Cognizant".
+  3. Cache reranker and Gemini responses keyed by query hash with a short
+     TTL.
+  4. Move static frontend to a CDN, add API rate limiting on Node.
+  5. MongoDB Atlas autoscaling for the vector search side - $vectorSearch
+     does benefit from more memory.
+  6. Separate read replicas for discussion listing vs. the write path.
+
+The vector search index itself scales to millions of docs without code
+changes - that's one of the reasons I picked Atlas Vector Search over
+self-hosted alternatives.
+
+
+================================================================================
+SECTION 2 — RAG ARCHITECTURE  (Q8-Q15)
+================================================================================
+
+------------------------------------------------------------------------------
+Q8. What is RAG and why use it?
+------------------------------------------------------------------------------
+ANSWER:
+RAG is Retrieval-Augmented Generation. Instead of asking an LLM to answer
+from its frozen training data, you retrieve relevant documents from your
+own knowledge base first and put them into the prompt as context. The LLM
+generates the answer grounded in that fresh, private information.
+
+I used it because the entire value of my app is peer-to-peer interview
+experiences written by students at our own college. That data is private
+- it doesn't exist on Google, Glassdoor, or in Gemini's training data.
+RAG is the only way to surface it through an AI chat interface.
+
+------------------------------------------------------------------------------
+Q9. Walk me through your RAG pipeline step by step.
+------------------------------------------------------------------------------
+ANSWER:
+The pipeline lives in Rag-Service-main/pipeline.py:
+
+  1. User question hits POST /chat on the FastAPI service.
+  2. Small-talk filter - if the message is "hi", "thanks", "ok", we skip
+     RAG entirely and return a canned reply. Saves Gemini calls.
+  3. Embed the query using Gemini's text-embedding-001 with task_type
+     "retrieval_query" - this generates a 768-dim vector.
+  4. Run Atlas $vectorSearch against the discussions collection,
+     filtered to category "interview-experience", pulling top 20
+     candidates with a loose 0.3 cosine threshold (loose because the
+     reranker will filter further).
+  5. Rerank the 20 candidates with Jina's cross-encoder API, keeping the
+     top 5 - more on this in Q15.
+  6. Decide if web search is needed based on keywords like "latest",
+     "2025", "recent" - if yes, hit Tavily for up to 3 results from
+     glassdoor, ambitionbox, linkedin, geeksforgeeks.
+  7. Build a context-aware prompt - different prompts for campus-only,
+     web-only, or both.
+  8. Send the prompt to Gemini 2.5 Flash (temperature 0.3, max tokens
+     1200) and return the generated answer.
+
+------------------------------------------------------------------------------
+Q10. Why did you embed query and document with different task_types?
+------------------------------------------------------------------------------
+ANSWER:
+Gemini's embedding model supports task_type as a parameter. I pass:
+  - "retrieval_document" when embedding a stored discussion
+  - "retrieval_query" when embedding a user's chat message
+
+The same model produces slightly different embeddings depending on the
+task. Documents and queries play different roles in retrieval - documents
+are dense and detailed, queries are short and intent-bearing. Using the
+matching task_type at each end improves recall noticeably. It's a free
+quality win.
+
+------------------------------------------------------------------------------
+Q11. How do you handle empty or weak retrieval results?
+------------------------------------------------------------------------------
+ANSWER:
+Three fallback layers:
+  1. In the retriever - if $vectorSearch returns no docs above min_score,
+     the result list is empty.
+  2. In the pipeline - _needs_web_search returns true if campus_docs is
+     empty, triggering Tavily search to fetch external context.
+  3. In the generator - there are four prompt variants: campus+web,
+     campus-only, web-only, and fallback (no context at all). The
+     fallback prompt asks Gemini to give general placement guidance
+     while staying on-topic.
+
+This means the chatbot never fails to respond. Worst case, it answers
+from Gemini's general knowledge with the topic constrained to placement
+prep.
+
+------------------------------------------------------------------------------
+Q12. How do you keep the chatbot from going off-topic?
+------------------------------------------------------------------------------
+ANSWER:
+Three guardrails in the prompt:
+  1. Persona pinning - every prompt opens with "You are an interview-
+     experience assistant for Campus Connect." This anchors the model's
+     identity.
+  2. Topic constraint - the fallback prompt explicitly says "If the
+     question is not interview-related, politely redirect it back to
+     placement/interview help."
+  3. Low temperature - generation_config sets temperature to 0.3 so the
+     model stays focused rather than creative.
+
+If I needed harder guardrails I'd add a pre-classifier that scores
+"is this an interview question" before the pipeline even runs, but the
+prompt-level guard has been enough for my use case.
+
+------------------------------------------------------------------------------
+Q13. How do you hide "I retrieved this from documents" leakage in answers?
+------------------------------------------------------------------------------
+ANSWER:
+LLMs love to say things like "based on the campus discussions...". That
+breaks the user experience because they don't know what "campus
+discussions" means. So I explicitly instruct the prompt:
+
+  "Do not mention campus discussions, campus data, retrieved documents,
+   or sources. Do not say 'based on campus data' or 'according to campus
+   discussions'."
+
+This is prompt engineering for tone control. Without that line, Gemini
+hallucinates a meta-commentary that reveals the retrieval step to the
+user.
+
+------------------------------------------------------------------------------
+Q14. What is your fallback when the Python RAG service is down?
+------------------------------------------------------------------------------
+ANSWER:
+In chatController.js the Node backend wraps the ragChat call in
+try/catch. If the Python service times out or returns an error, it falls
+back to calling Groq with Llama-3.3-70b-versatile directly - just the
+LLM, no retrieval. The user still gets an answer, just without their
+campus context.
+
+This is graceful degradation: full feature when everything works,
+degraded but useful when one service is down. Critical for student-
+facing apps where downtime is a deal-breaker.
+
+------------------------------------------------------------------------------
+Q15. What is reranking and when does it help?
+------------------------------------------------------------------------------
+ANSWER:
+Vector search uses a bi-encoder - it embeds the query once and the
+documents once, then compares by cosine similarity. This is fast but
+approximate.
+
+Reranking uses a cross-encoder - it takes (query, document) pairs and
+scores them jointly. Much more accurate, but too slow to run on the
+whole DB. So the pattern is two-stage:
+  Stage 1: bi-encoder vector search pulls 20 candidates fast.
+  Stage 2: cross-encoder rescores those 20 and returns the top 5.
+
+I used Jina's hosted jina-reranker-v2-base-multilingual via REST API.
+My Reranker class gracefully degrades - if the API key is missing or
+the call fails, it returns the original top_k unchanged. The chatbot
+never crashes because reranking is optional.
+
+Reranking helps most when you have many candidates and the query is
+nuanced. For tiny datasets it adds latency without much quality gain -
+I noted this limitation honestly.
+
+
+================================================================================
+SECTION 3 — MONGODB VECTOR SEARCH & EMBEDDINGS  (Q16-Q23)
+================================================================================
+
+------------------------------------------------------------------------------
+Q16. What is a vector embedding?
+------------------------------------------------------------------------------
+ANSWER:
+An embedding is a dense numeric representation of text - in my case, a
+list of 768 floating-point numbers. The model is trained so that texts
+with similar meaning produce vectors that are close together in 768-
+dimensional space (high cosine similarity).
+
+This lets me search by meaning instead of by keyword. The query "what
+is the Infosys SDE interview like" will match a discussion titled
+"Infosys software developer technical rounds" even though no words
+overlap - the meaning is similar.
+
+------------------------------------------------------------------------------
+Q17. How did you set up Atlas Vector Search?
+------------------------------------------------------------------------------
+ANSWER:
+  1. In MongoDB Atlas UI, I created a Vector Search Index on the
+     'discussions' collection.
+  2. Index name: "discussion_embeddings"
+  3. Path: "embedding" (the array field on each Discussion document)
+  4. Dimensions: 768 (matches Gemini's text-embedding-001 output)
+  5. Similarity: cosine
+  6. I marked the embedding field as select:false in Mongoose so it
+     never leaks through normal queries.
+
+Embeddings are generated by my Python service whenever a discussion is
+created - the Node controller fires off a POST to /embed on the FastAPI
+service, which calls Gemini, stores the vector with $set on the same
+document.
+
+------------------------------------------------------------------------------
+Q18. Explain the $vectorSearch aggregation stage you wrote.
+------------------------------------------------------------------------------
+ANSWER:
+From retriever.py:
+
+  {
+    "$vectorSearch": {
+      "index": "discussion_embeddings",
+      "path": "embedding",
+      "queryVector": query_vector,
+      "numCandidates": max(100, limit * 10),
+      "limit": limit * 2
+    }
+  }
+
+Key parameters:
+  - index: which Atlas vector index to hit
+  - path: which field on the doc stores the vector
+  - queryVector: the 768-dim embedding of the user's question
+  - numCandidates: how many candidates ANN scans internally before
+    ranking. Atlas docs recommend 10-20x the limit.
+  - limit: how many final results to return
+
+I then $project the needed fields plus the score via
+{"$meta": "vectorSearchScore"} and apply a $match for category in a
+prior stage if needed.
+
+------------------------------------------------------------------------------
+Q19. What is the difference between numCandidates and limit?
+------------------------------------------------------------------------------
+ANSWER:
+numCandidates is the breadth of the ANN search. Atlas Vector Search uses
+Hierarchical Navigable Small World graphs internally - it doesn't compare
+the query to every document, that would be O(N). Instead it walks a graph
+and considers only a candidate set of size numCandidates.
+
+  - Higher numCandidates = better recall (more likely to find the true
+    top-K) but slower.
+  - limit = how many of those candidates you actually return.
+
+The recommended ratio is 10-20x. I picked max(100, limit * 10) - the
+max(100, ...) floor ensures small limits still get adequate candidate
+breadth.
+
+------------------------------------------------------------------------------
+Q20. Why cosine similarity and not Euclidean distance?
+------------------------------------------------------------------------------
+ANSWER:
+Cosine similarity measures the angle between two vectors. It's
+direction-based and ignores magnitude. Text embeddings naturally vary in
+magnitude based on length, frequency of certain words, etc. - that's
+noise, not signal. Cosine strips that noise.
+
+Euclidean distance is sensitive to magnitude, so a long document and a
+short query would score badly even if they mean the same thing. For NLP
+embeddings, cosine is the standard. Gemini's embedding model is trained
+with cosine in mind.
+
+------------------------------------------------------------------------------
+Q21. Why did you embed (title + content + tags + category) together?
+------------------------------------------------------------------------------
+ANSWER:
+A title alone is too short - "Cognizant Interview" doesn't tell the
+embedding model what's inside. Content alone misses category cues.
+Tags add additional intent signals.
+
+By concatenating all four into a "rich text" string I give the
+embedding model maximum signal:
+
+  Title: ...
+  Category: interview-experience
+  Tags: cognizant, sde, off-campus
+  Content: ...
+
+This noticeably improves recall - queries that mention the company name
+match even if the title is generic. It's a small embedding-prep choice
+that has outsized impact on retrieval quality.
+
+------------------------------------------------------------------------------
+Q22. What is select:false on the embedding field and why use it?
+------------------------------------------------------------------------------
+ANSWER:
+In Mongoose, select:false means the field is excluded by default from
+find() queries. I added it to embedding because:
+  1. It's a 768-element array - ~6KB per doc. Returning it for every
+     listing wastes bandwidth.
+  2. The frontend never needs to see it - only the Python retriever
+     uses it during $vectorSearch.
+
+To explicitly include it in a query you can call .select('+embedding').
+This is a small detail but shows attention to network and payload size.
+
+------------------------------------------------------------------------------
+Q23. Why did you pick Atlas Vector Search over Pinecone, Weaviate, or FAISS?
+------------------------------------------------------------------------------
+ANSWER:
+  - Atlas: I already have my data here. No second service to sync, no
+    extra connection string, no double-writes. Free tier covers my
+    scale. Production-grade ANN under the hood.
+  - Pinecone: would mean keeping discussions in Mongo AND vectors in
+    Pinecone with consistency challenges. Adds cost and operational
+    surface.
+  - Weaviate: similar story to Pinecone, self-hosted adds infra.
+  - FAISS: amazing for static datasets, but it's a library, not a DB.
+    I'd have to manage persistence, sharding, and live updates myself.
+
+For a project at my scale with data already in Mongo, Atlas Vector
+Search is the pragmatic choice. If I ever hit 50M+ documents or needed
+sub-10ms latency at scale, I'd revisit Pinecone.
+
+LIMITATION TO MENTION HONESTLY: Atlas Vector Search is newer than
+Pinecone - some advanced features like hybrid search, filtered ANN
+with complex predicates, and reranking are less mature. For most
+applications, that doesn't matter.
+
+
+================================================================================
+SECTION 4 — LLM INTEGRATION  (Q24-Q28)
+================================================================================
+
+------------------------------------------------------------------------------
+Q24. Why Gemini 2.5 Flash and not GPT-4 or Claude?
+------------------------------------------------------------------------------
+ANSWER:
+Three reasons:
+  1. Cost - Gemini Flash is significantly cheaper per token than GPT-4
+     class models. For a student-facing app with high free-tier usage
+     that matters a lot.
+  2. Latency - Flash is optimized for speed, around 200-400ms TTFT in
+     my testing.
+  3. Quality - For my use case (synthesizing a student-friendly answer
+     from 5 short documents) Flash is more than enough. I don't need
+     GPT-4 level reasoning to summarize an interview experience.
+
+I use the same provider for embeddings and generation, so one API key
+covers the whole AI surface.
+
+------------------------------------------------------------------------------
+Q25. Why temperature 0.3 and not 0.7 or 1.0?
+------------------------------------------------------------------------------
+ANSWER:
+Temperature controls randomness in LLM sampling. Lower = more focused
+and deterministic. Higher = more creative and varied.
+
+For RAG, you want the model to STICK to the retrieved context, not
+hallucinate creative tangents. 0.3 is a good middle ground - the
+answer still reads naturally, but the model is biased toward grounded
+output. If I dropped to 0.0 it would feel robotic and repetitive. If
+I went to 0.8 the model would start inventing details.
+
+------------------------------------------------------------------------------
+Q26. What is the context window and how do you stay within it?
+------------------------------------------------------------------------------
+ANSWER:
+The context window is the maximum number of tokens the model can read
+in one call. Gemini 2.5 Flash supports up to 1M tokens, way more than
+I need.
+
+My prompt budget:
+  - 5 reranked campus docs, each ~500 tokens = ~2500 tokens
+  - Up to 3 web results, each ~300 tokens = ~900 tokens
+  - User question + system instructions = ~300 tokens
+  Total: ~3700 tokens, comfortably under the limit.
+
+I cap the output at 1200 tokens via max_output_tokens to keep responses
+short and the response time predictable.
+
+------------------------------------------------------------------------------
+Q27. How do you handle LLM hallucinations?
+------------------------------------------------------------------------------
+ANSWER:
+Three layers:
+  1. Grounding with RAG - the most reliable defense. Giving the model
+     real documents drastically reduces hallucination because it has
+     factual material to cite.
+  2. Low temperature (0.3) - reduces creative inventing.
+  3. Explicit prompt instruction - "Use the campus discussions and web
+     results as reference material only" - this signals the model not
+     to invent.
+
+I do not currently fact-check the model output. If I wanted stronger
+guarantees I'd add a second LLM call as a verifier, or implement
+citation-grounded generation where each sentence must cite a source
+index from the retrieved docs.
+
+------------------------------------------------------------------------------
+Q28. What is the difference between Groq and Gemini in your code?
+------------------------------------------------------------------------------
+ANSWER:
+Groq is an inference provider - they serve open-weight models like
+Llama on custom hardware (LPUs) that gives much faster token throughput
+than typical GPU inference. In my chatController.js, Groq runs
+llama-3.3-70b-versatile as the FALLBACK when the Python RAG service is
+down. No retrieval, just the LLM answering from its training knowledge.
+
+Gemini is Google's proprietary closed-weight model family. I use it as
+the PRIMARY both for embeddings and generation inside the Python RAG
+pipeline.
+
+So: Gemini = primary (with RAG context), Groq Llama = fallback (no RAG).
+
+
+================================================================================
+SECTION 5 — FRONTEND (REACT)  (Q29-Q34)
+================================================================================
+
+------------------------------------------------------------------------------
+Q29. How does the AuthContext work?
+------------------------------------------------------------------------------
+ANSWER:
+AuthContext is a React Context that provides {user, login, logout,
+register, loading} to the entire app. The AuthProvider component wraps
+the app in main.jsx.
+
+On mount it runs checkAuth() once - reads user data and expiry from
+localStorage, validates expiry (24-hour session), and if needed falls
+back to GET /user/current-user to revalidate against the backend.
+
+The provider conditionally renders children only when loading is false,
+preventing flicker where protected routes render briefly before auth
+state hydrates.
+
+Any component can call useAuth() to get the current user. ProtectedRoute
+uses this to redirect unauthenticated users to /login.
+
+------------------------------------------------------------------------------
+Q30. Why localStorage and not sessionStorage or cookies?
+------------------------------------------------------------------------------
+ANSWER:
+  - localStorage: persists across tabs and browser restarts. Used for
+    user data + session expiry so the UI rehydrates on refresh.
+  - sessionStorage: scoped to the tab. Used in autcontext.jsx for the
+    'pinged' flag - a one-time warmup ping to keep the backend cold-
+    start latency hidden. Doesn't need to persist past the tab.
+  - httpOnly Cookies: used for the actual auth tokens. JavaScript can't
+    read them, so they're immune to XSS-based token theft. The browser
+    sends them automatically with axios when withCredentials: true.
+
+So: cookies hold the tokens, localStorage holds the user profile data
+for UI rehydration. This is the standard secure pattern.
+
+------------------------------------------------------------------------------
+Q31. Why is the useEffect dependency array empty in checkAuth?
+------------------------------------------------------------------------------
+ANSWER:
+An empty dependency array tells React: run this effect once when the
+component mounts, never again. Since AuthProvider wraps the entire app,
+"mount" means the React app starts up - first visit, or any full page
+refresh.
+
+I don't want checkAuth running on every state change because:
+  1. It would hit the network repeatedly with no benefit.
+  2. localStorage is the source of truth between mounts, so React state
+     never gets out of sync.
+
+The tradeoff: if a session expires while the user has the tab open for
+24+ hours, they won't be auto-logged-out until they refresh. For a
+campus app that's acceptable.
+
+------------------------------------------------------------------------------
+Q32. How is the chatbot UI structured?
+------------------------------------------------------------------------------
+ANSWER:
+ChatBot.jsx is a single component with:
+  - useState for messages array, input text, loading state
+  - useRef on the messages container for auto-scroll on new messages
+  - useEffect that scrolls to bottom whenever messages change
+  - Form submit handler that POSTs the message + history to
+    /api/v1/chat/chat via axios
+  - Renders user messages and bot messages with different styling
+  - Loading indicator while waiting for response
+
+The history is built client-side and sent with each request so the
+backend can construct conversational context. This is "stateless"
+chat - the server doesn't track conversation between calls, the
+frontend resends everything.
+
+------------------------------------------------------------------------------
+Q33. How did you handle CORS?
+------------------------------------------------------------------------------
+ANSWER:
+Two places:
+  1. Node backend (app.js) uses the cors middleware with an allowlist:
+     localhost:5173, localhost:5174, and the two production deployments
+     (Vercel + Netlify). credentials: true so cookies are accepted.
+  2. Python FastAPI service (main.py) uses CORSMiddleware with localhost
+     allowlist - only needed because during dev the frontend might call
+     it directly for testing. In production only the Node backend talks
+     to the Python service.
+
+Without CORS, browsers would block cross-origin requests because of the
+Same-Origin Policy. This is a security feature, not a bug - explicit
+allowlist is the right pattern.
+
+------------------------------------------------------------------------------
+Q34. What is React Router doing here?
+------------------------------------------------------------------------------
+ANSWER:
+React Router gives me client-side routing - URL changes don't reload
+the page, the router swaps which component is rendered. The setup:
+  - <BrowserRouter> wraps the app
+  - <Routes> contains <Route> definitions for /home, /profile,
+    /chatbot, /discussion, /leaderboard, /login, /register, /roadmap
+  - <ProtectedRoute> wraps the routes that need auth
+  - useNavigate() in components for programmatic navigation
+    (e.g. after login)
+
+This makes the app feel instant on navigation while still having
+shareable URLs. The downside is the first page load needs full JS - I
+mitigate this with Vite's code splitting in production builds.
+
+
+================================================================================
+SECTION 6 — BACKEND (NODE/EXPRESS)  (Q35-Q40)
+================================================================================
+
+------------------------------------------------------------------------------
+Q35. How is the backend structured?
+------------------------------------------------------------------------------
+ANSWER:
+Standard MVC-ish layout:
+  - models/ - Mongoose schemas (User, Discussion, Post, etc.)
+  - controllers/ - request handlers with business logic
+  - routes/ - Express routers that map URLs to controllers
+  - services/ - third-party integrations (ragService for the Python
+    pipeline)
+  - middlewares/ - auth check, request logging, error handling
+  - utils/ - helpers (asynchandler, Apierror, Apiresponse)
+
+The asynchandler util wraps async controllers and forwards errors to
+the centralized error handler in app.js. This means controllers don't
+need their own try/catch - cleaner code.
+
+Apiresponse and Apierror are response envelope classes that give
+consistent JSON shape across every endpoint.
+
+------------------------------------------------------------------------------
+Q36. How does the embedding flow work end-to-end?
+------------------------------------------------------------------------------
+ANSWER:
+  1. User submits a new discussion via POST /api/v1/discussion/create
+     on Node.
+  2. discussion.controllers.js createDiscussion handler saves the
+     document.
+  3. After saving, it calls embedDiscussion(newDiscussion) from
+     ragService.js - this is fire-and-forget with .catch() to swallow
+     errors. The user gets a 201 response immediately.
+  4. embedDiscussion POSTs to http://localhost:8001/embed on the
+     Python service.
+  5. Python's main.py /embed handler validates the body with Pydantic
+     and calls pipeline.embed().
+  6. pipeline.embed() calls embedder.embed_discussion() which composes
+     the rich text and calls Gemini.
+  7. The 768-dim vector is written back to the same MongoDB document
+     via update_one with $set on embedding.
+
+The flow is async but the user doesn't wait for it - the embedding
+appears on the document a moment later.
+
+------------------------------------------------------------------------------
+Q37. Why fire-and-forget for embedding?
+------------------------------------------------------------------------------
+ANSWER:
+Embedding takes 500-2000ms because it's a network call to Gemini.
+Making the user wait for that on POST /discussion creates a slow UX
+and ties up the request worker.
+
+By firing it without awaiting, the user gets their 201 fast and the
+embedding completes in the background. If it fails, the document just
+has no vector - it won't appear in chatbot retrieval, but the
+discussion still exists and is searchable by text.
+
+Risk: if the Python service is down, that discussion permanently has
+no embedding. In production I'd address this with a retry queue
+(BullMQ) and a periodic backfill job that scans for documents missing
+embedding and re-embeds them.
+
+------------------------------------------------------------------------------
+Q38. How do you protect routes that need authentication?
+------------------------------------------------------------------------------
+ANSWER:
+An auth middleware (typically auth.middleware.js) runs before
+protected route handlers. It:
+  1. Reads the access token from req.cookies.accessToken or the
+     Authorization header.
+  2. Verifies the JWT signature with jwt.verify and the
+     ACCESS_TOKEN_SECRET.
+  3. If valid, decodes the payload, looks up the user in DB, attaches
+     req.user.
+  4. If invalid or expired, returns 401.
+
+Then routes apply it selectively, like:
+  router.post('/create', verifyJWT, createDiscussion)
+
+The frontend's ProtectedRoute component is the UI counterpart - it
+checks useAuth().user and redirects to /login if missing.
+
+------------------------------------------------------------------------------
+Q39. Walk me through what happens when a user sends a chat message.
+------------------------------------------------------------------------------
+ANSWER:
+  1. Frontend ChatBot.jsx form submit -> axios POST to /api/v1/chat/chat
+     with {message, history}.
+  2. Node chatRoutes.js routes it to chatController.js .chat handler.
+  3. Handler calls ragChat(userMessage, userId) - which is an axios POST
+     to Python http://localhost:8001/chat with 45s timeout.
+  4. Python main.py /chat -> pipeline.chat(message).
+  5. pipeline.chat: small-talk check, embed query, retrieve from Atlas,
+     rerank with Jina, optionally web search, generate with Gemini.
+  6. Python returns {response, ragUsed, sourcesCount, webUsed}.
+  7. Node returns that JSON to frontend.
+  8. Frontend appends bot's response to messages state, scrolls to
+     bottom, hides loading.
+
+If step 3 or 4 throws, Node falls back to Groq Llama with the
+conversation history - the user still gets an answer.
+
+------------------------------------------------------------------------------
+Q40. How does your error handling work globally?
+------------------------------------------------------------------------------
+ANSWER:
+Three layers:
+  1. asynchandler util wraps every async controller, catches thrown
+     errors, calls next(err).
+  2. Apierror class extends Error with a statusCode field. Throwing
+     new Apierror(400, "Missing fields") gives consistent semantics.
+  3. The Express error middleware in app.js (last in the chain) catches
+     forwarded errors and returns:
+       {success: false, message: err.message, statusCode: err.statusCode}
+
+This means controllers never have their own try/catch - they just
+throw and the system handles it. Consistent shape, single point of
+logging.
+
+
+================================================================================
+SECTION 7 — AUTHENTICATION & SECURITY  (Q41-Q44)
+================================================================================
+
+------------------------------------------------------------------------------
+Q41. Walk me through JWT auth.
+------------------------------------------------------------------------------
+ANSWER:
+JWT = JSON Web Token. A signed, base64-encoded token containing user
+claims. Structure: header.payload.signature.
+
+My setup:
+  - generateAccessToken in User.model.js signs {_id, email, username}
+    with ACCESS_TOKEN_SECRET, short expiry (e.g. 15 min).
+  - generateRefreshToken signs {_id} with REFRESH_TOKEN_SECRET, longer
+    expiry (e.g. 7 days). Stored on the user document.
+  - Both are sent to the client as httpOnly cookies.
+  - On each protected request, server reads access cookie, verifies
+    signature, attaches user.
+  - When access expires, frontend can call /refresh-token which checks
+    the refresh cookie against the stored value, and if matches, issues
+    a new access token (and optionally rotates the refresh token too).
+
+Why two tokens: access is short so a leaked token has limited blast
+radius. Refresh is long but server-side revocable by clearing it from
+the user document.
+
+------------------------------------------------------------------------------
+Q42. Why bcrypt with 10 rounds?
+------------------------------------------------------------------------------
+ANSWER:
+bcrypt is a deliberately slow hashing function designed for password
+storage. The "rounds" parameter is 2^rounds iterations - 10 means
+1024 iterations of the inner Blowfish operation per hash.
+
+10 is the current ballparked sweet spot:
+  - Slow enough to make brute-force attacks expensive
+    (~100ms per hash on modern hardware)
+  - Fast enough that login feels instant to users
+
+Lower (e.g. 4) makes brute-force trivial. Higher (e.g. 14) makes
+login feel sluggish. As hardware speeds up over time, you bump this
+up - bcrypt has migration tooling for that.
+
+The pre('save') hook in User.model.js runs hashing only when the
+password field is modified - critical, otherwise updating the bio
+would re-hash an already-hashed password.
+
+------------------------------------------------------------------------------
+Q43. What security risks did you address?
+------------------------------------------------------------------------------
+ANSWER:
+  - SQL/NoSQL injection: Mongoose schemas type-check input. I never
+    interpolate user input into raw queries.
+  - XSS: React auto-escapes JSX by default. I avoid
+    dangerouslySetInnerHTML.
+  - Token theft: tokens in httpOnly cookies, unreadable by JS.
+  - CORS: explicit origin allowlist on both Node and Python services.
+  - Password leakage: bcrypt hashing pre-save, never returned in
+    responses.
+  - PII in embedding: discussions are voluntarily public content. I
+    don't embed private DMs or resumes.
+  - Rate limiting: NOT currently implemented. This is an honest gap I'd
+    add with express-rate-limit before production.
+
+------------------------------------------------------------------------------
+Q44. What is XSS and how does React protect against it?
+------------------------------------------------------------------------------
+ANSWER:
+XSS = Cross-Site Scripting. An attacker injects HTML/JS into your
+page (e.g. via a comment field) so it runs in other users' browsers
+- potentially stealing tokens, redirecting, defacing.
+
+React protects automatically because JSX expressions are escaped
+before being rendered. When I write:
+
+  <p>{userInput}</p>
+
+React HTML-encodes userInput so <script> becomes &lt;script&gt;. The
+browser sees text, not executable code.
+
+The escape hatch is dangerouslySetInnerHTML, which bypasses escaping.
+I never use it on user content. If I ever needed to render rich text
+I'd sanitize with DOMPurify first.
+
+
+================================================================================
+SECTION 8 — COLLABORATIVE FILTERING & RECOMMENDATIONS  (Q45-Q47)
+================================================================================
+
+------------------------------------------------------------------------------
+Q45. How does your recommendation system work?
+------------------------------------------------------------------------------
+ANSWER:
+collaborativeFiltering.js implements user-user collaborative filtering:
+
+  1. Build a user-post interaction matrix - rows are users, columns
+     are posts, cell value is 1 if the user liked that post.
+  2. For a target user, compute cosine similarity between their row
+     and every other user's row.
+  3. Sort other users by similarity.
+  4. For each similar user (in order), collect posts they liked that
+     the target user hasn't seen.
+  5. Stop at 10 recommendations.
+
+The intuition: "users who liked similar posts to you also liked these
+- you might too."
+
+------------------------------------------------------------------------------
+Q46. What is cosine similarity in the recommendation context?
+------------------------------------------------------------------------------
+ANSWER:
+Same math as in vector search: dot product divided by the product of
+magnitudes. The result is between -1 and 1, where 1 = identical
+direction (highly similar tastes), 0 = orthogonal (unrelated), -1 =
+opposite.
+
+In my matrix, user vectors are binary (1 if liked, 0 if not).
+Two users who liked exactly the same 5 posts get a similarity of 1.0.
+Two users with no overlap get 0.0.
+
+This is a classic user-based collaborative filtering setup. Works well
+when the matrix isn't too sparse - which it can become at scale.
+
+------------------------------------------------------------------------------
+Q47. What are the limitations of user-based collaborative filtering?
+------------------------------------------------------------------------------
+ANSWER:
+  1. Cold start - new users have no likes, no similarity, no
+     recommendations. Same for new posts.
+  2. Sparsity - real interaction matrices are 99%+ zeros. Cosine
+     similarity becomes noisy on sparse vectors.
+  3. Scalability - O(N^2) to compute all user-user similarities. At
+     1M users this breaks.
+  4. Filter bubble - recommends what's popular among similar users,
+     can over-narrow taste.
+
+In production I'd move to item-based CF (more stable, scales better)
+or matrix factorization (e.g. ALS) - or hybrid with content-based
+filtering using the same embeddings I'm already generating for
+discussions.
+
+
+================================================================================
+SECTION 9 — DEEP CONCEPT QUESTIONS  (Q48-Q50)
+================================================================================
+
+------------------------------------------------------------------------------
+Q48. What is the difference between a bi-encoder and a cross-encoder?
+------------------------------------------------------------------------------
+ANSWER:
+BI-ENCODER (used by Gemini's text-embedding-001):
+  - Encodes query and document independently into vectors.
+  - Comparison is fast: just compute cosine similarity between two
+    precomputed vectors. O(1) per comparison.
+  - Documents can be pre-embedded and stored - retrieval is just a
+    vector lookup.
+  - Less accurate because the model never sees query and document
+    together.
+
+CROSS-ENCODER (used by Jina's reranker):
+  - Takes (query, document) as a single input, outputs a relevance
+    score.
+  - The model attends across both texts jointly - captures fine-
+    grained interactions.
+  - Much more accurate.
+  - Slow - cannot pre-compute, must run for every (query, doc) pair
+    at query time.
+
+The two-stage pattern I use exploits both: bi-encoder retrieves a
+candidate set fast, cross-encoder rescores it accurately. Best of
+both worlds.
+
+------------------------------------------------------------------------------
+Q49. What is "RAG hallucination" and how do you mitigate it?
+------------------------------------------------------------------------------
+ANSWER:
+RAG hallucination is when the LLM generates information not present
+in the retrieved documents - either by relying on training memory or
+by inventing. RAG mitigates hallucination compared to bare LLM use,
+but doesn't eliminate it.
+
+My mitigations:
+  1. Strong grounding via reranking - top 5 docs are highly relevant,
+     so the model has less reason to fall back on training memory.
+  2. Low temperature (0.3) - reduces creative inventing.
+  3. Explicit prompt instructions - "use as reference material".
+  4. Fallback handling - if retrieval is empty, the fallback prompt
+     keeps the model on-topic instead of guessing wildly.
+
+What I do NOT do (but could):
+  - Citation grounding - require each sentence to cite a source index.
+  - Verifier pass - a second LLM call that scores the answer against
+    sources.
+  - Confidence thresholds - refuse to answer if retrieval scores are
+    too low.
+
+These are the next steps if I needed stronger guarantees.
+
+------------------------------------------------------------------------------
+Q50. If you had to redesign Campus-Connect from scratch, what would you change?
+------------------------------------------------------------------------------
+ANSWER:
+Honest answer (interviewers love honesty):
+  1. Use TypeScript end-to-end - I lose hours to typos and shape bugs
+     that strict types would catch at compile time.
+  2. Move embedding to a background job queue (BullMQ + Redis) instead
+     of fire-and-forget - more reliable, retryable.
+  3. Consolidate Node and Python into one Python FastAPI service - the
+     two-service split was educational but the operational complexity
+     isn't justified at this scale.
+  4. Add proper observability - structured logs (pino), error tracking
+     (Sentry), latency metrics on each pipeline step. Right now I have
+     print statements.
+  5. Cache layer with Redis - both for chat responses and for embedded
+     queries.
+  6. Citations in chatbot output - small UI to show "answer based on
+     these 3 discussions" with click-through.
+  7. Hybrid search - combine $vectorSearch with $text keyword search
+     for queries that mention specific terms like company names.
+  8. Add tests - unit tests for the retriever, integration tests for
+     /chat. None right now, which is the biggest gap.
+
+I'd keep: the model choices (Gemini Flash + Groq fallback), the
+Atlas Vector Search decision, the reranking pattern, the prompt
+structure, and the React/Tailwind frontend.
+
+
+================================================================================
+BONUS — CONCEPTS YOU SHOULD ALSO KNOW (NOT QUESTIONS, FACTS)
+================================================================================
+
+REACT CONCEPTS USED:
+  - useState, useEffect, useContext, useRef, useNavigate (router)
+  - Custom hooks (useAuth)
+  - Conditional rendering, controlled inputs, lifting state up
+  - React Router v6 with BrowserRouter / Routes / Route
+  - Tailwind CSS for styling
+  - Vite as build tool (faster than CRA, ES module-native)
+
+NODE/EXPRESS CONCEPTS USED:
+  - Middleware chain (cors, cookieParser, express.json, custom auth)
+  - async/await with asynchandler wrapper
+  - Mongoose ODM (schemas, populate, pre-save hooks, instance methods)
+  - JWT (access + refresh token pattern)
+  - bcrypt password hashing
+  - Multer for file uploads
+  - dotenv for environment variables
+  - axios for outbound HTTP calls
+
+PYTHON CONCEPTS USED:
+  - FastAPI + Pydantic for type-safe API
+  - async/await (FastAPI is async-native)
+  - PyMongo for MongoDB
+  - google-generativeai SDK
+  - requests for HTTP (Jina reranker)
+  - python-dotenv for env vars
+  - Class-based service organization (Embedder, Retriever, Reranker,
+    Generator, WebSearch, RAGPipeline)
+
+ML/AI CONCEPTS USED:
+  - Embeddings (768-dim, cosine similarity)
+  - Vector search (ANN, HNSW)
+  - Bi-encoder vs cross-encoder
+  - Two-stage retrieval (retrieve + rerank)
+  - RAG (retrieval-augmented generation)
+  - Prompt engineering (persona, constraints, temperature)
+  - LLM context windows
+  - Graceful degradation (fallback chains)
+
+DATABASES CONCEPTS USED:
+  - MongoDB document model
+  - Mongoose schemas, refs, populate
+  - Atlas Vector Search ($vectorSearch, numCandidates, limit)
+  - select:false for field projection
+  - Indexed lookups vs vector lookups
+
+SYSTEM DESIGN CONCEPTS USED:
+  - Service separation (frontend / API / RAG)
+  - Fire-and-forget background work
+  - Graceful degradation (RAG -> Groq fallback)
+  - CORS allowlists
+  - Stateless chat (frontend sends history)
+  - Health checks (/health endpoint)
+  - Environment-based config
+
+
+================================================================================
+HOW TO USE THIS DOCUMENT
+================================================================================
+
+1. Read each section twice - once for understanding, once for memorization.
+2. For each question, practice the answer OUT LOUD - written answers are
+   different from spoken ones.
+3. Time your answers - aim for 30-90 seconds per question.
+4. Pair up with someone (or use a mirror) and answer cold.
+5. When you can answer 40+ of these without looking, you're interview-ready.
+6. For the questions you struggle with - go back to the actual file in the
+   code and trace the logic line by line until it clicks.
+7. Don't memorize verbatim - understand the WHY behind each answer, so you
+   can handle follow-up questions you haven't seen.
+
+If the interviewer asks something not on this list, fall back to:
+  - "Let me walk through that step by step..." (buys you thinking time)
+  - "There are roughly three things going on here..." (structures your
+     answer)
+  - "The tradeoff I considered was X vs Y, and I picked X because..."
+     (shows engineering judgment)
+
+GOOD LUCK!
+================================================================================
